@@ -2,12 +2,17 @@ import { NextResponse } from 'next/server';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { supabase } from '../../../lib/supabase';
 
-// Initialize the Gemini AI with your secret key
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
-export async function GET() {
+export async function GET(request: Request) {
+  // 🔒 SECURITY CHECK: Ensure only Vercel can run this
+  const authHeader = request.headers.get('authorization');
+  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+    return NextResponse.json({ error: 'Unauthorized. Only Vercel can trigger the news room.' }, { status: 401 });
+  }
+
   try {
-    // 1. Fetch Top Headlines from GNews (fetching 3 at a time for testing)
+    // 1. Fetch Top Headlines from GNews
     const gnewsUrl = `https://gnews.io/api/v4/top-headlines?category=general&lang=en&max=3&apikey=${process.env.GNEWS_API_KEY}`;
     const newsResponse = await fetch(gnewsUrl);
     const newsData = await newsResponse.json();
@@ -16,7 +21,6 @@ export async function GET() {
       return NextResponse.json({ error: 'No articles found from GNews' }, { status: 400 });
     }
 
-    // Use the fast Gemini model
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
     const processedArticles = [];
 
@@ -36,15 +40,13 @@ export async function GET() {
         {"summary": "your bullet points here", "is_real": true}
       `;
 
-      // Get the AI's response
       const result = await model.generateContent(prompt);
       let responseText = result.response.text();
       
-      // Clean up the response just in case Gemini adds formatting
       responseText = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
       const aiData = JSON.parse(responseText);
 
-      // 3. Save the clean, AI-processed news into your Supabase database
+      // 3. Save to Supabase
       const { error } = await supabase
         .from('articles')
         .insert([
@@ -63,7 +65,6 @@ export async function GET() {
       }
     }
 
-    // Let us know it worked!
     return NextResponse.json({ 
       message: "Success! The AI News Room just processed new articles.", 
       articles_added: processedArticles 
