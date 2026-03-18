@@ -13,7 +13,7 @@ export async function GET(request: Request) {
 
   try {
     // 1. Fetch Top Headlines
-    const gnewsUrl = `https://gnews.io/api/v4/top-headlines?category=general&lang=en&max=3&apikey=${process.env.GNEWS_API_KEY}`;
+    const gnewsUrl = `https://gnews.io/api/v4/top-headlines?category=general&lang=en&max=10&apikey=${process.env.GNEWS_API_KEY}`;
     const newsResponse = await fetch(gnewsUrl);
     const newsData = await newsResponse.json();
 
@@ -27,18 +27,20 @@ export async function GET(request: Request) {
     // 2. Loop through each article and let AI process it
     for (const article of newsData.articles) {
       const prompt = `
-        You are a highly professional news editor. Analyze this raw news data:
+        You are a highly professional, analytical news editor. Analyze this raw news data:
         Title: ${article.title}
         Description: ${article.description}
         Content: ${article.content}
 
         Tasks:
-        1. Write a strict 2-3 bullet point summary of the most important facts. Keep it unbiased and extremely concise.
-        2. Assess if this appears to be a legitimate, factual news story (true) or highly sensationalized/fake (false).
-        3. Categorize this article into exactly ONE of these categories: Business, Technology, Sports, Politics, Entertainment, Health, World, or General.
+        1. Write a strict 2 bullet point summary of the facts.
+        2. Write a short, original paragraph titled "Why It Matters:". This paragraph MUST provide unique analytical insight, context, or implications of this news. Do not just repeat the facts; tell the reader why this impacts the world, economy, or tech industry. 
+        3. Combine the bullet points and the "Why It Matters" paragraph into a single formatted string.
+        4. Assess if this appears to be a legitimate, factual news story (true) or highly sensationalized (false).
+        5. Categorize this article into exactly ONE of these categories: Business, Technology, Sports, Politics, Entertainment, Health, World, or General.
 
         Respond ONLY with a valid JSON object in this exact format, with no markdown formatting or extra text:
-        {"summary": "your bullet points here", "is_real": true, "category": "Technology"}
+        {"summary": "• Fact 1\\n• Fact 2\\n\\nWhy It Matters:\\nYour original analysis here.", "is_real": true, "category": "Technology"}
       `;
 
       const result = await model.generateContent(prompt);
