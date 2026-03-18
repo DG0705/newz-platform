@@ -1,8 +1,13 @@
 import { NextResponse } from 'next/server';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { supabase } from '../../../lib/supabase';
+import Parser from 'rss-parser';
+
+// 🚀 CRITICAL: Increases the Vercel serverless timeout limit to 60 seconds
+export const maxDuration = 60;
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+const parser = new Parser();
 
 export async function GET(request: Request) {
   // 🔒 SECURITY CHECK
@@ -12,66 +17,99 @@ export async function GET(request: Request) {
   }
 
   try {
-    // 1. Fetch Top Headlines
-    const gnewsUrl = `https://gnews.io/api/v4/top-headlines?category=general&lang=en&max=10&apikey=${process.env.GNEWS_API_KEY}`;
-    const newsResponse = await fetch(gnewsUrl);
-    const newsData = await newsResponse.json();
+    let combinedRawArticles: any[] = [];
 
-    if (!newsData.articles) {
-      return NextResponse.json({ error: 'No articles found' }, { status: 400 });
+    // ==========================================
+    // SOURCE 1: GNews API (Max 10 Articles)
+    // ==========================================
+    try {
+      const gnewsUrl = `https://gnews.io/api/v4/top-headlines?category=general&lang=en&max=10&apikey=${process.env.GNEWS_API_KEY}`;
+      const newsResponse = await fetch(gnewsUrl);
+      const newsData = await newsResponse.json();
+      
+      if (newsData.articles) {
+        combinedRawArticles = [...combinedRawArticles, ...newsData.articles];
+      }
+    } catch (e) {
+      console.error("GNews fetch failed:", e);
     }
 
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
-    const processedArticles = [];
-
-    // 2. Loop through each article and let AI process it
-    for (const article of newsData.articles) {
-      const prompt = `
-        You are a highly professional, analytical news editor. Analyze this raw news data:
-        Title: ${article.title}
-        Description: ${article.description}
-        Content: ${article.content}
-
-        Tasks:
-        1. Write a strict 2 bullet point summary of the facts.
-        2. Write a short, original paragraph titled "Why It Matters:". This paragraph MUST provide unique analytical insight, context, or implications of this news. Do not just repeat the facts; tell the reader why this impacts the world, economy, or tech industry. 
-        3. Combine the bullet points and the "Why It Matters" paragraph into a single formatted string.
-        4. Assess if this appears to be a legitimate, factual news story (true) or highly sensationalized (false).
-        5. Categorize this article into exactly ONE of these categories: Business, Technology, Sports, Politics, Entertainment, Health, World, or General.
-
-        Respond ONLY with a valid JSON object in this exact format, with no markdown formatting or extra text:
-        {"summary": "• Fact 1\\n• Fact 2\\n\\nWhy It Matters:\\nYour original analysis here.", "is_real": true, "category": "Technology"}
-      `;
-
-      const result = await model.generateContent(prompt);
-      let responseText = result.response.text();
+    // ==========================================
+    // SOURCE 2: Free RSS Feed (BBC News - Max 20 Articles)
+    // ==========================================
+    try {
+      const feed = await parser.parseURL('http://feeds.bbci.co.uk/news/rss.xml');
       
-      responseText = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
-      const aiData = JSON.parse(responseText);
+      const rssArticles = feed.items.slice(0, 20).map(item => ({
+        title: item.title || "",
+        description: item.contentSnippet || "", 
+        content: item.content || "", 
+        url: item.link || ""
+      }));
 
-      // 3. Save to Supabase (Now includes category!)
-      const { error } = await supabase
-        .from('articles')
-        .insert([
-          {
-            title: article.title,
-            summary: aiData.summary,
-            source_url: article.url,
-            is_real: aiData.is_real,
-            category: aiData.category // <-- NEW DATA POINT
-          }
-        ]);
+      combinedRawArticles = [...combinedRawArticles, ...rssArticles];
+    } catch (e) {
+      console.error("RSS fetch failed:", e);
+    }
 
-      if (error) {
-        console.error("Database Save Error:", error);
-      } else {
-        processedArticles.push(article.title);
-      }
+    if (combinedRawArticles.length === 0) {
+      return NextResponse.json({ error: 'No articles found from any source' }, { status: 400 });
+    }
+
+    // ==========================================
+    // AI PROCESSING (SINGLE BATCH METHOD)
+    // ==========================================
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); 
+    
+    // 1. Prepare a single prompt containing ALL articles mapped by an ID
+    const prompt = `
+      You are a highly professional news editor. I am providing you with a JSON array of raw news articles.
+      
+      Tasks for EVERY article:
+      1. Write a strict 2-3 bullet point summary of the most important facts. Keep it unbiased and extremely concise.
+      2. Assess if it is real news (true) or fake/sensationalized (false).
+      3. Categorize it into EXACTLY ONE of: Business, Technology, Sports, Politics, Entertainment, Health, World, or General.
+
+      Here is the raw data:
+      ${JSON.stringify(combinedRawArticles.map((a, i) => ({ id: i, title: a.title, description: a.description, content: a.content })))}
+
+      Respond ONLY with a valid JSON array of objects in this exact format matching the IDs, with no markdown formatting or extra text:
+      [
+        {"id": 0, "summary": "bullets...", "is_real": true, "category": "Technology"},
+        {"id": 1, "summary": "bullets...", "is_real": true, "category": "Sports"}
+      ]
+    `;
+
+    // 2. Make ONE single request to Gemini
+    const result = await model.generateContent(prompt);
+    let responseText = result.response.text();
+    
+    // Clean up markdown code blocks if Gemini adds them
+    responseText = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
+    const aiDataArray = JSON.parse(responseText);
+
+    // 3. Match the AI responses back to the original URLs
+    const dbInserts = aiDataArray.map((aiData: any) => {
+      const originalArticle = combinedRawArticles[aiData.id];
+      return {
+        title: originalArticle.title,
+        summary: aiData.summary,
+        source_url: originalArticle.url,
+        is_real: aiData.is_real,
+        category: aiData.category 
+      };
+    });
+
+    // 4. Save ALL articles to Supabase in one single bulk operation
+    const { error } = await supabase.from('articles').insert(dbInserts);
+
+    if (error) {
+      console.error("Database Bulk Save Error:", error);
+      return NextResponse.json({ error: 'Failed to save to database.' }, { status: 500 });
     }
 
     return NextResponse.json({ 
-      message: "Success! Processed new articles with categories.", 
-      articles_added: processedArticles 
+      message: `Success! Fetched, processed, and saved ${dbInserts.length} articles.`, 
     });
 
   } catch (error) {
